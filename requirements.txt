@@ -1,0 +1,15 @@
+torch
+transformers
+sentence-transformers
+numpy
+scikit-learn
+gradio>=4.8.0
+langchain
+langchain-community
+langchain-huggingface
+openai
+networkx
+chromadb
+PyPDF2
+tiktoken
+Pillow
