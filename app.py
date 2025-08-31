@@ -3,39 +3,37 @@ import json
 import asyncio
 import threading
 import logging
-from typing import Optional, List, Any, Tuple
+from typing import Optional, List, Any, Tuple, Dict
 
 import gradio as gr
 import websockets
+import requests
 from openai import OpenAI
 from PyPDF2 import PdfReader
 
 from langchain.schema import Document
 from langchain.llms.base import LLM
 
-# Your GraphRAG system (assumed available in your env)
 from graph_rag import GraphRAG
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------------------------------
-# Globals
-# -----------------------------------------------------------------------------
 graph_rag_system: Optional[GraphRAG] = None
 documents_processed: bool = False
 websocket_server = None
 connected_clients = set()
 
+# Search-agent config
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8080")
+OVERPASS_URL = os.getenv("OVERPASS_URL", "https://overpass-api.de/api/interpreter")
+USER_AGENT = "GraphRAG-Pharmacy/1.0 (+inventory)"
 
-# -----------------------------------------------------------------------------
-# SEALION LangChain Wrapper
-# -----------------------------------------------------------------------------
+# OSRM router
+OSRM_URL = os.getenv("OSRM_URL", "http://router.project-osrm.org")  # e.g. http://localhost:5000
+-
+# SEALION LangChain Wrapper 
 class SEALIONWrapper(LLM):
-    """Custom LangChain wrapper for SEALION API."""
     client: Any = None
     model_name: str = "aisingapore/Llama-SEA-LION-v3.5-8B-R"
 
@@ -47,17 +45,7 @@ class SEALIONWrapper(LLM):
     def _llm_type(self) -> str:
         return "sealion"
 
-    def _call(
-        self,
-        prompt: str,
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[Any] = None,
-        **kwargs: Any,
-    ) -> str:
-        """
-        Returns a JSON string. If the first try isn't valid JSON, we repair once.
-        JSON schema includes uiLabels for front-end rendering (no hardcoding).
-        """
+    def _call(self, prompt: str, stop=None, run_manager=None, **kwargs: Any) -> str:
         system_msg = (
             "You are a medical AI assistant with access to a GraphRAG medical database.\n"
             "Return ONLY valid JSON that matches EXACTLY the schema below. Do NOT add any prose outside the JSON.\n\n"
@@ -69,20 +57,20 @@ class SEALIONWrapper(LLM):
             "- Never fall back to English unless the user wrote in English.\n\n"
             "JSON schema:\n"
             "{\n"
-            '  "analysis": string,                       // in L_user\n'
+            '  "analysis": string,\n'
             '  "severity": "low" | "medium" | "high",\n'
-            '  "medicines": [                           // names untransformed; desc/dosage text in L_user\n'
+            '  "medicines": [\n'
             '    {"name": string, "dosage": string, "description": string, "localAvailability": string},\n'
             '    {"name": string, "dosage": string, "description": string, "localAvailability": string}\n'
             "  ],\n"
-            '  "disclaimer": string,                    // in L_user\n'
+            '  "disclaimer": string,\n'
             '  "seekEmergencyCare": boolean,\n'
-            '  "language": string,                      // ISO 639-1 code you detected for L_user\n'
-            '  "uiLabels": {                            // short UI labels in L_user (no examples)\n'
-            '     "recommended": string,                // heading for the list of medicines\n'
-            '     "dosage": string,                     // label preceding dosage text\n'
-            '     "availability": string,               // label/phrase for availability badge\n'
-            '     "emergency": string                   // short emergency warning\n'
+            '  "language": string,\n'
+            '  "uiLabels": {\n'
+            '     "recommended": string,\n'
+            '     "dosage": string,\n'
+            '     "availability": string,\n'
+            '     "emergency": string\n'
             "  }\n"
             "}\n\n"
             "Content rules:\n"
@@ -94,14 +82,10 @@ class SEALIONWrapper(LLM):
         def chat_once(user_msg: str) -> str:
             completion = self.client.chat.completions.create(
                 model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
-                extra_body={
-                    "chat_template_kwargs": {"thinking_mode": "off"},
-                    "cache": {"no-cache": True},
-                },
+                messages=[{"role": "system", "content": system_msg},
+                          {"role": "user", "content": user_msg}],
+                extra_body={"chat_template_kwargs": {"thinking_mode": "off"},
+                            "cache": {"no-cache": True}},
                 temperature=0.1,
                 max_tokens=1500,
             )
@@ -110,46 +94,39 @@ class SEALIONWrapper(LLM):
         try:
             out = chat_once(prompt).strip()
         except Exception as e:
-            logger.error(f"SEALION API error on first try: {e}")
-            return f'{{"analysis":"Error calling SEALION.","severity":"low","medicines":[],"disclaimer":"","seekEmergencyCare":false,"language":"en","uiLabels":{"recommended":"Recommended medicines:","dosage":"Dosage","availability":"Check availability","emergency":"Seek emergency medical care immediately"}}}'
-
-        # If not valid JSON, ask the model to convert to JSON once
-        if not (out.startswith("{") and out.endswith("}")):
-            repair_prompt = (
-                "Convert the following answer into EXACTLY the required JSON schema, "
-                "keeping all text in the user's language. Return ONLY the JSON:\n\n"
-                f"{out}"
+            logger.error(f"SEALION API error: {e}")
+            return (
+                '{"analysis":"Error calling SEALION.","severity":"low","medicines":[],"disclaimer":"",'
+                '"seekEmergencyCare":false,"language":"en","uiLabels":{"recommended":"Recommended medicines:",'
+                '"dosage":"Dosage","availability":"Check availability","emergency":"Seek emergency medical care immediately"}}'
             )
+
+        if not (out.startswith("{") and out.endswith("}")):
             try:
-                out = chat_once(repair_prompt).strip()
+                out = chat_once(
+                    "Convert the following answer into EXACTLY the required JSON schema and return ONLY the JSON:\n\n"
+                    f"{out}"
+                ).strip()
             except Exception as e:
-                logger.error(f"SEALION API error during repair: {e}")
-                # Safe minimal JSON
+                logger.error(f"SEALION repair error: {e}")
                 out = (
-                    '{"analysis":"Unable to produce JSON.","severity":"low","medicines":[],'
-                    '"disclaimer":"","seekEmergencyCare":false,"language":"en",'
-                    '"uiLabels":{"recommended":"Recommended medicines:","dosage":"Dosage",'
-                    '"availability":"Check availability","emergency":"Seek emergency medical care immediately"}}'
+                    '{"analysis":"Unable to produce JSON.","severity":"low","medicines":[],"disclaimer":"",'
+                    '"seekEmergencyCare":false,"language":"en","uiLabels":{"recommended":"Recommended medicines:",'
+                    '"dosage":"Dosage","availability":"Check availability","emergency":"Seek emergency medical care immediately"}}'
                 )
         return out
 
 
-# -----------------------------------------------------------------------------
-# Model Initialization
-# -----------------------------------------------------------------------------
+# Model Initialization / PDFs
 def initialize_models() -> Tuple[Optional[GraphRAG], str]:
-    """Initialize embeddings + LLM + GraphRAG."""
     try:
-        # Use SentenceTransformers directly (simple + avoids LangChain embedding quirks)
         from sentence_transformers import SentenceTransformer
 
         class DirectEmbeddings:
             def __init__(self):
                 self.model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
             def embed_documents(self, texts: List[str]):
                 return self.model.encode(texts, convert_to_tensor=False).tolist()
-
             def embed_query(self, text: str):
                 return self.model.encode(text, convert_to_tensor=False).tolist()
 
@@ -159,21 +136,15 @@ def initialize_models() -> Tuple[Optional[GraphRAG], str]:
         api_key = os.getenv("SEALION_API_KEY")
         if not api_key:
             logger.warning("⚠️ SEALION_API_KEY not set — calls will fail.")
-
-        # LLM
         try:
             llm = SEALIONWrapper(api_key=api_key)
             logger.info("✅ SEALION LLM initialized")
-            # Smoke test
-            test_response = llm._call("Hi")
-            if not (test_response.strip().startswith("{") and test_response.strip().endswith("}")):
-                logger.warning("⚠️ SEALION test did not return JSON. Continuing anyway.")
+            _ = llm._call("Hi")
         except Exception as e:
             msg = f"❌ Error initializing SEALION: {e}"
             logger.error(msg)
             return None, msg
 
-        # GraphRAG
         try:
             graph_rag = GraphRAG(embedding_model, llm)
             logger.info("✅ GraphRAG system initialized")
@@ -183,7 +154,6 @@ def initialize_models() -> Tuple[Optional[GraphRAG], str]:
             return None, msg
 
         return graph_rag, "✅ Models initialized successfully!"
-
     except ImportError as e:
         msg = f"❌ Missing dependency: {e}. Run: pip install sentence-transformers"
         logger.error(msg)
@@ -193,22 +163,14 @@ def initialize_models() -> Tuple[Optional[GraphRAG], str]:
         logger.error(msg)
         return None, msg
 
-
-# -----------------------------------------------------------------------------
-# Document Processing
-# -----------------------------------------------------------------------------
 def process_pdf_files(files) -> str:
-    """Process uploaded PDF files and build knowledge graph."""
     global graph_rag_system, documents_processed
-
     if not files:
         return "❌ No files uploaded. Please upload PDF files first."
-
     if graph_rag_system is None:
         graph_rag_system, init_msg = initialize_models()
         if graph_rag_system is None:
             return init_msg
-
     try:
         documents: List[Document] = []
         processed_files: List[str] = []
@@ -216,359 +178,440 @@ def process_pdf_files(files) -> str:
 
         for file_path in files:
             try:
-                logger.info(f"Processing file: {file_path}")
-
                 reader = PdfReader(file_path)
                 text = ""
-                for page_num, page in enumerate(reader.pages):
+                for page in reader.pages:
                     try:
                         text += page.extract_text() or ""
                     except Exception as e:
-                        logger.warning(f"Error extracting page {page_num} from {file_path}: {e}")
-                        continue
-
+                        logger.warning(f"PDF page extract error: {e}")
                 if text.strip():
-                    documents.append(
-                        Document(page_content=text, metadata={"source": os.path.basename(file_path)})
-                    )
+                    documents.append(Document(page_content=text, metadata={"source": os.path.basename(file_path)}))
                     processed_files.append(os.path.basename(file_path))
-                    logger.info(f"✅ Extracted text from {os.path.basename(file_path)}")
                 else:
                     failed_files.append(os.path.basename(file_path))
-                    logger.warning(f"❌ No extractable text in {os.path.basename(file_path)}")
-
             except Exception as e:
                 failed_files.append(os.path.basename(file_path))
                 logger.error(f"Error processing {file_path}: {e}")
-                continue
 
         if not documents:
             return "❌ No valid PDF content found in uploaded files."
 
-        # Build knowledge graph
-        try:
-            logger.info("Building knowledge graph...")
-            graph_rag_system.process_documents(documents)
-            documents_processed = True
-            logger.info("✅ Knowledge graph built successfully")
-        except Exception as e:
-            msg = f"❌ Error building knowledge graph: {e}"
-            logger.error(msg)
-            return msg
+        graph_rag_system.process_documents(documents)
+        documents_processed = True
 
-        # Graph stats
         try:
             num_nodes = len(graph_rag_system.knowledge_graph.graph.nodes())
             num_edges = len(graph_rag_system.knowledge_graph.graph.edges())
-        except Exception as e:
-            logger.warning(f"Error getting graph stats: {e}")
+        except Exception:
             num_nodes = num_edges = 0
 
-        success_msg = (
+        msg = (
             f"✅ Successfully processed {len(documents)} documents!\n\n"
-            f"📊 **Graph Statistics:**\n"
-            f"- **Nodes:** {num_nodes}\n"
-            f"- **Edges:** {num_edges}\n"
-            f"- **Files processed:** {', '.join(processed_files)}"
+            f"📊 Graph: {num_nodes} nodes / {num_edges} edges\n"
+            f"Files processed: {', '.join(processed_files)}"
         )
         if failed_files:
-            success_msg += f"\n- **Failed files:** {', '.join(failed_files)}"
-        success_msg += "\n\n🌐 WebSocket server is ready to receive queries from clients!"
-
-        return success_msg
-
+            msg += f"\nFailed files: {', '.join(failed_files)}"
+        msg += "\n\n🌐 WebSocket server is ready to receive queries from clients!"
+        return msg
     except Exception as e:
         msg = f"❌ Unexpected error processing documents: {e}"
         logger.error(msg)
         return msg
 
+# Helper: Overpass, OSRM, SearXNG (GPS-only)
+def searxng_search(query: str, language: Optional[str] = None, pageno: int = 1, timeout: int = 10) -> Dict[str, Any]:
+    url = SEARXNG_URL.rstrip("/") + "/search"
+    params = {"q": query, "format": "json", "pageno": pageno, "safesearch": 1}
+    if language:
+        params["language"] = language
+    r = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
-# -----------------------------------------------------------------------------
-# Query Handling (WebSocket)
-# -----------------------------------------------------------------------------
+def overpass_pharmacies(center: Dict[str, float], radius_km: int, limit: int = 50) -> List[Dict[str, Any]]:
+    R = max(100, min(50000, int(radius_km * 1000)))
+    q = f"""
+    [out:json][timeout:25];
+    (
+      node["amenity"="pharmacy"](around:{R},{center['lat']},{center['lon']});
+      way["amenity"="pharmacy"](around:{R},{center['lat']},{center['lon']});
+    );
+    out tags center {min(limit, 200)};
+    """
+    r = requests.post(OVERPASS_URL, data=q, headers={"User-Agent": USER_AGENT}, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("elements", [])
+
+def osrm_route_km_min(
+    lat1: float, lon1: float, lat2: float, lon2: float,
+    timeout: int = 15,
+    origin_snap_radius_m: int = 80,   # tighten snap to avoid far jumps
+    dest_snap_radius_m: int = 150
+) -> Optional[Tuple[float, float]]:
+    """
+    Returns (distance_km, duration_min) using OSRM. None if no route found.
+    Uses 'radiuses' to limit how far OSRM may snap points to the road network.
+    """
+    try:
+        url = f"{OSRM_URL.rstrip('/')}/route/v1/driving/{lon1},{lat1};{lon2},{lat2}"
+        params = {
+            "overview": "false",
+            "alternatives": "false",
+            "steps": "false",
+            "radiuses": f"{origin_snap_radius_m};{dest_snap_radius_m}",
+        }
+        r = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+        r.raise_for_status()
+        js = r.json()
+        if not js.get("routes"):
+            return None
+        route = js["routes"][0]
+        dist_km = round((route.get("distance", 0.0) or 0.0) / 1000.0, 2)
+        dur_min = round((route.get("duration", 0.0) or 0.0) / 60.0, 1)
+        return dist_km, dur_min
+    except Exception as e:
+        logger.debug(f"OSRM route error: {e}")
+        return None
+
+def score_availability(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    if any(k in t for k in ["in stock", "available", "còn hàng", "có sẵn", "thêm vào giỏ", "add to cart"]):
+        return "in_stock"
+    if any(k in t for k in ["out of stock", "hết hàng", "ngừng kinh doanh"]):
+        return "out_of_stock"
+    return None
+
+def status_to_score(status: str) -> float:
+    return {
+        "in_stock": 0.92,
+        "likely_in_stock": 0.70,
+        "call_to_confirm": 0.50,
+        "out_of_stock": 0.0,
+    }.get(status, 0.0)
+
+# GPS-only pharmacy search
+async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    GPS-only.
+    payload: {
+      "user_location": {"lat": float, "lon": float, "accuracy_m"?: number, "ts"?: number},  # REQUIRED
+      "radius_km": int,
+      "limit": int,
+      "language": str | None,
+      "medicines": [{"name": str, "dosage": str?}, ...]
+    }
+    """
+    user_location = payload.get("user_location")
+    radius_km = int(payload.get("radius_km") or 8)
+    limit = int(payload.get("limit") or 12)
+    language = payload.get("language")
+    medicines = payload.get("medicines") or []
+
+    if not medicines:
+        return {"center": None, "city": None, "pharmacies": [], "message": "No medicines provided."}
+
+    if not user_location or "lat" not in user_location or "lon" not in user_location:
+        return {
+            "center": None,
+            "city": None,
+            "pharmacies": [],
+            "source": "gps-only",
+            "fallbackUsed": False,
+            "radius_km": radius_km,
+            "message": "GPS not provided. Tap 'Use my location'.",
+        }
+
+    # Pull accuracy if provided
+    try:
+        accuracy_m = float(user_location.get("accuracy_m") or 0.0)
+    except Exception:
+        accuracy_m = 0.0
+
+    center = {"lat": float(user_location["lat"]), "lon": float(user_location["lon"])}
+    logger.info(f"🔎 GPS center used: {center} (accuracy_m={accuracy_m})")
+
+    # Reject obviously-bad fixes to avoid routing from a wrong district
+    if accuracy_m and accuracy_m > 1000:
+        return {
+            "center": center,
+            "city": None,
+            "pharmacies": [],
+            "source": "gps-only",
+            "fallbackUsed": False,
+            "radius_km": radius_km,
+            "message": f"Location too imprecise (~{int(accuracy_m)}m). Try again near a window with Precise Location on.",
+        }
+
+    # 1) Nearby pharmacies via Overpass around GPS
+    try:
+        elems = await asyncio.to_thread(overpass_pharmacies, center, radius_km, max(100, limit * 4))
+    except Exception as e:
+        logger.error(f"Overpass error: {e}")
+        elems = []
+
+    candidates: List[Dict[str, Any]] = []
+    for e in elems:
+        tags = e.get("tags", {}) or {}
+        lat = (e.get("lat") or e.get("center", {}).get("lat"))
+        lon = (e.get("lon") or e.get("center", {}).get("lon"))
+        if lat is None or lon is None:
+            continue
+
+        addr_parts = [
+            tags.get("addr:housenumber"),
+            tags.get("addr:street"),
+            tags.get("addr:suburb"),
+            tags.get("addr:city"),
+            tags.get("addr:state"),
+            tags.get("addr:postcode"),
+            tags.get("addr:country"),
+        ]
+        address = ", ".join([p for p in addr_parts if p])
+
+        candidates.append({
+            "id": f"osm_{e.get('type','n')}_{e.get('id')}",
+            "name": tags.get("name") or "Pharmacy",
+            "address": address or tags.get("addr:full"),
+            "latitude": str(lat),
+            "longitude": str(lon),
+            "country": tags.get("addr:country"),
+            "city": tags.get("addr:city"),
+            "phoneNumber": tags.get("phone") or tags.get("contact:phone"),
+            "openingHours": tags.get("opening_hours"),
+            # distance_km to be filled via OSRM
+        })
+
+    if not candidates:
+        return {
+            "center": center,
+            "city": None,
+            "pharmacies": [],
+            "source": "overpass (none)",
+            "fallbackUsed": False,
+            "radius_km": radius_km,
+            "message": "No nearby pharmacies found from Overpass.",
+        }
+
+    # 2) OSRM route distance/ETA from GPS (with limited snapping)
+    async def add_osrm_metrics(p: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            lat2, lon2 = float(p["latitude"]), float(p["longitude"])
+            res = await asyncio.to_thread(
+                osrm_route_km_min,
+                center["lat"], center["lon"], lat2, lon2,
+                15,   # timeout
+                80,   # origin snap radius (m)
+                150   # destination snap radius (m)
+            )
+            if res is not None:
+                dist_km, dur_min = res
+                p["distance_km"] = dist_km
+                p["duration_min"] = dur_min
+            else:
+                p["distance_km"] = None
+            return p
+        except Exception as e:
+            logger.debug(f"OSRM metrics error for {p.get('id')}: {e}")
+            p["distance_km"] = None
+            return p
+
+    candidates = await asyncio.gather(*[add_osrm_metrics(p) for p in candidates])
+
+    # 3) Availability via SearXNG
+    async def enrich_pharmacy(p: Dict[str, Any]) -> Dict[str, Any]:
+        matches = []
+        for m in medicines:
+            med_name = m.get("name") or ""
+            base_queries: List[str] = [
+                f'{med_name} "{p["name"]}"',
+                f"{med_name}"
+            ]
+
+            best = None
+            for q in base_queries[:3]:
+                try:
+                    js = await asyncio.to_thread(searxng_search, q, language)
+                except Exception:
+                    continue
+                for item in js.get("results", []):
+                    text = f'{item.get("title","")} {item.get("content","")}'
+                    status = score_availability(text) or "likely_in_stock"
+                    cand = {
+                        "medicineName": med_name,
+                        "status": status,
+                        "score": status_to_score(status),
+                        "url": item.get("url"),
+                    }
+                    if (best is None) or (cand["score"] > best["score"]):
+                        best = cand
+            if best is None:
+                best = {"medicineName": med_name, "status": "call_to_confirm", "score": status_to_score("call_to_confirm")}
+            matches.append(best)
+
+        best_score = max((mm["score"] for mm in matches), default=0.0)
+        p_out = {**p, "matches": matches, "bestScore": best_score}
+        return p_out
+
+    enriched = await asyncio.gather(*[enrich_pharmacy(p) for p in candidates])
+
+    def good_count(ph: Dict[str, Any]) -> int:
+        return sum(1 for mm in ph.get("matches", []) if mm["status"] != "out_of_stock")
+
+    enriched.sort(
+        key=lambda ph: (
+            -good_count(ph),
+            -(ph.get("bestScore") or 0.0),
+            ph.get("distance_km") if ph.get("distance_km") is not None else 1e9,
+        )
+    )
+
+    return {
+        "center": center,        
+        "city": None,
+        "pharmacies": enriched[:limit],
+        "source": "overpass+searxng+osrm (gps-only, unbiased)",
+        "fallbackUsed": False,
+        "radius_km": radius_km,
+    }
+
+
+# WebSocket + Admin UI 
 async def process_client_message(message: str, websocket) -> str:
-    """Process message from client and return JSON str to send back."""
     global graph_rag_system, documents_processed
-
     try:
         data = json.loads(message)
-        query = data.get("message", "")
+        msg_type = (data.get("type") or "").lower()
+
+        if msg_type == "pharmacy_search":
+            rid = data.get("rid")
+            payload = data.get("payload") or {}
+            logger.info(f"🔎 Pharmacy search rid={rid} payload={str(payload)[:200]}...")
+            result = await run_pharmacy_search(payload)
+            return json.dumps({"type": "pharmacy_search_result", "rid": rid, **result})
 
         if not documents_processed or graph_rag_system is None:
-            return json.dumps(
-                {
-                    "type": "error",
-                    "message": "System not ready. Please wait for admin to upload and process documents.",
-                }
-            )
+            return json.dumps({"type": "error", "message": "System not ready. Please upload and process documents."})
 
-        if not query.strip():
-            return json.dumps({"type": "error", "message": "Please enter a valid question."})
-
-        logger.info(f"Processing client query: {query}")
-
-        # GraphRAG query should return (answer, traversal_path, context_data)
-        answer, traversal_path, context_data = graph_rag_system.query(query)
-
-        # Try to parse medical JSON
-        try:
-            s = (answer or "").strip()
-            if s.startswith("{") and s.endswith("}"):
-                medical_response = json.loads(s)
-                if all(k in medical_response for k in ["analysis", "medicines", "severity"]):
-                    response = {
-                        "type": "medical_response",
-                        "message": medical_response.get("analysis", ""),
-                        "medicines": medical_response.get("medicines", []),
-                        "severity": medical_response.get("severity", "low"),
-                        "disclaimer": medical_response.get("disclaimer", ""),
-                        "seekEmergencyCare": medical_response.get("seekEmergencyCare", False),
-                        "uiLabels": medical_response.get("uiLabels", {}),
-                        "language": medical_response.get("language"),
-                        "metadata": {
-                            "traversal_nodes": len(traversal_path),
-                            "sources_used": context_data.get("num_sources", 0),
-                        },
-                    }
+        if msg_type in ("", "query"):
+            query = data.get("message", "")
+            if not query.strip():
+                return json.dumps({"type": "error", "message": "Please enter a valid question."})
+            answer, traversal_path, context_data = graph_rag_system.query(query)
+            try:
+                s = (answer or "").strip()
+                if s.startswith("{") and s.endswith("}"):
+                    medical_response = json.loads(s)
+                    if all(k in medical_response for k in ["analysis", "medicines", "severity"]):
+                        response = {
+                            "type": "medical_response",
+                            "message": medical_response.get("analysis", ""),
+                            "medicines": medical_response.get("medicines", []),
+                            "severity": medical_response.get("severity", "low"),
+                            "disclaimer": medical_response.get("disclaimer", ""),
+                            "seekEmergencyCare": medical_response.get("seekEmergencyCare", False),
+                            "uiLabels": medical_response.get("uiLabels", {}),
+                            "language": medical_response.get("language"),
+                            "metadata": {"traversal_nodes": len(traversal_path), "sources_used": context_data.get("num_sources", 0)},
+                        }
+                    else:
+                        response = {"type": "response", "message": answer,
+                                    "metadata": {"traversal_nodes": len(traversal_path), "sources_used": context_data.get("num_sources", 0)}}
                 else:
-                    # JSON but not medical schema -> treat as plain text
-                    response = {
-                        "type": "response",
-                        "message": answer,
-                        "metadata": {
-                            "traversal_nodes": len(traversal_path),
-                            "sources_used": context_data.get("num_sources", 0),
-                        },
-                    }
-            else:
-                # Plain text
-                response = {
-                    "type": "response",
-                    "message": answer,
-                    "metadata": {
-                        "traversal_nodes": len(traversal_path),
-                        "sources_used": context_data.get("num_sources", 0),
-                    },
-                }
-        except json.JSONDecodeError:
-            response = {
-                "type": "response",
-                "message": answer,
-                "metadata": {
-                    "traversal_nodes": len(traversal_path),
-                    "sources_used": context_data.get("num_sources", 0),
-                },
-            }
+                    response = {"type": "response", "message": answer,
+                                "metadata": {"traversal_nodes": len(traversal_path), "sources_used": context_data.get("num_sources", 0)}}
+            except json.JSONDecodeError:
+                response = {"type": "response", "message": answer,
+                            "metadata": {"traversal_nodes": len(traversal_path), "sources_used": context_data.get("num_sources", 0)}}
+            return json.dumps(response)
 
-        logger.info("✅ Query processed successfully via WebSocket")
-        return json.dumps(response)
-
+        return json.dumps({"type": "error", "message": f"Unknown message type: {msg_type}"})
     except json.JSONDecodeError:
         return json.dumps({"type": "error", "message": "Invalid message format"})
     except Exception as e:
         logger.error(f"Error processing WebSocket message: {e}")
         return json.dumps({"type": "error", "message": f"Error processing query: {e}"})
 
-
-# -----------------------------------------------------------------------------
-# WebSocket Server
-# -----------------------------------------------------------------------------
 async def websocket_handler(websocket, path: Optional[str] = None):
-    """Handle WebSocket connections (compatible with websockets v10–v12)."""
     connected_clients.add(websocket)
-    logger.info(f"Client connected. Total clients: {len(connected_clients)}")
-
     try:
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "connection",
-                    "message": "Connected to GraphRAG server",
-                    "status": "ready" if documents_processed else "waiting_for_documents",
-                }
-            )
-        )
-
+        await websocket.send(json.dumps({"type": "connection", "message": "Connected", "status": "ready" if documents_processed else "waiting_for_documents"}))
         async for message in websocket:
             response = await process_client_message(message, websocket)
             await websocket.send(response)
-
-    except websockets.exceptions.ConnectionClosed:
-        logger.info("Client disconnected")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
     finally:
         if websocket in connected_clients:
             connected_clients.remove(websocket)
-        logger.info(f"Client removed. Total clients: {len(connected_clients)}")
-
 
 def start_websocket_server():
-    """Start the WebSocket server in a separate thread."""
     async def serve():
         global websocket_server
-        websocket_server = await websockets.serve(
-            websocket_handler,
-            "0.0.0.0",
-            8765,
-            ping_interval=20,
-            ping_timeout=10,
-        )
-        logger.info("🌐 WebSocket server started on ws://0.0.0.0:8765")
-        await asyncio.Future()  # run forever
-
+        websocket_server = await websockets.serve(websocket_handler, "0.0.0.0", 8765, ping_interval=20, ping_timeout=10)
+        await asyncio.Future()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(serve())
 
-
-# -----------------------------------------------------------------------------
-# Admin Utilities + Gradio UI
-# -----------------------------------------------------------------------------
 def reset_system() -> str:
-    """Reset the entire system."""
     global graph_rag_system, documents_processed
     graph_rag_system = None
     documents_processed = False
-    logger.info("🔄 System reset")
-    return "🔄 System reset. Please upload documents again."
-
+    return "System reset. Please upload documents again."
 
 def get_system_status() -> str:
-    """Get current system status."""
     global graph_rag_system, documents_processed, connected_clients
-
-    status_parts: List[str] = []
-
+    parts: List[str] = []
     if graph_rag_system is None:
-        status_parts.append("❌ Models not initialized")
+        parts.append("Models not initialized")
     elif not documents_processed:
-        status_parts.append("⚠️ Models ready, no documents processed")
+        parts.append("Models ready, no documents processed")
     else:
         try:
             num_nodes = len(graph_rag_system.knowledge_graph.graph.nodes())
             num_edges = len(graph_rag_system.knowledge_graph.graph.edges())
-            status_parts.append(f"✅ System ready - {num_nodes} nodes, {num_edges} edges")
+            parts.append(f"System ready - {num_nodes} nodes, {num_edges} edges")
         except Exception as e:
-            status_parts.append(f"⚠️ System ready but error getting stats: {e}")
-
-    status_parts.append(f"🌐 WebSocket: {len(connected_clients)} clients connected")
-    return "\n".join(status_parts)
-
+            parts.append(f"System ready but error getting stats: {e}")
+    parts.append(f"WebSocket: {len(connected_clients)} clients connected")
+    return "\n".join(parts)
 
 def create_admin_interface():
-    """Create the Gradio admin interface for document management."""
-    with gr.Blocks(
-        title="GraphRAG Admin Panel",
-        theme=gr.themes.Soft(),
-        css="""
-        .gradio-container { max-width: 1200px !important; }
-        .header { text-align: center; margin-bottom: 30px; }
-        .status-box { background-color: #f0f2f6; padding: 15px; border-radius: 10px; margin: 10px 0; }
-        """,
-    ) as demo:
-
-        gr.HTML("""
-        <div class="header">
-            <h1>🔧 GraphRAG Admin Panel</h1>
-            <p>Document Management and System Administration</p>
-            <p style="color: #666;">WebSocket Server: ws://localhost:8765</p>
-        </div>
-        """)
-
+    with gr.Blocks(title="GraphRAG Admin Panel", theme=gr.themes.Soft()) as demo:
+        gr.HTML("<h1>🔧 GraphRAG Admin Panel</h1><p>WebSocket Server: ws://localhost:8765</p>")
         with gr.Row():
-            with gr.Column(scale=1):
-                gr.HTML("<h2>📄 Document Management</h2>")
-
-                file_upload = gr.File(
-                    label="Upload PDF Files",
-                    file_types=[".pdf"],
-                    file_count="multiple",
-                )
-
-                process_btn = gr.Button("🚀 Process Documents", variant="primary", size="lg")
-
-                upload_status = gr.Textbox(
-                    label="Processing Status",
-                    interactive=False,
-                    lines=10,
-                    value="Upload PDF files and click 'Process Documents' to build the knowledge graph...",
-                )
-
-            with gr.Column(scale=1):
-                gr.HTML("<h2>📊 System Status</h2>")
-
-                system_status = gr.Textbox(
-                    label="Current Status",
-                    interactive=False,
-                    lines=4,
-                    value="❌ Models not initialized\n🌐 WebSocket: 0 clients connected",
-                )
-
-                with gr.Row():
-                    refresh_status_btn = gr.Button("🔄 Refresh Status")
-                    reset_btn = gr.Button("🗑️ Reset System", variant="stop")
-
+            with gr.Column():
+                file_upload = gr.File(label="Upload PDF Files", file_types=[".pdf"], file_count="multiple")
+                process_btn = gr.Button("🚀 Process Documents", variant="primary")
+                upload_status = gr.Textbox(label="Processing Status", interactive=False, lines=10)
+            with gr.Column():
+                system_status = gr.Textbox(label="Current Status", interactive=False, lines=6, value=get_system_status())
+                refresh_status_btn = gr.Button("🔄 Refresh Status")
+                reset_btn = gr.Button("🗑️ Reset System", variant="stop")
                 gr.HTML("""
-                <div class="status-box">
-                    <h3>ℹ️ Admin Instructions:</h3>
-                    <ul>
-                        <li>Upload PDF documents and process them to build the knowledge graph</li>
-                        <li>The WebSocket server runs on port 8765</li>
-                        <li>Clients can connect to ws://[server-ip]:8765 to send queries</li>
-                        <li>Monitor connected clients and system status here</li>
-                        <li>The knowledge graph persists until system reset</li>
-                    </ul>
-                </div>
-                """)
-
-                gr.HTML("""
-                <div class="status-box">
-                    <h3>🔡 WebSocket Message Format:</h3>
-                    <pre style="background: #f5f5f5; padding: 10px; border-radius: 5px;">
-// Client sends:
+                <pre>// Pharmacy search payload (GPS-only)
 {
-  "message": "User's question here"
+  "type": "pharmacy_search",
+  "rid": "uuid-or-timestamp",
+  "payload": {
+    "user_location": {"lat": 1.3521, "lon": 103.8198, "accuracy_m": 25},
+    "radius_km": 8,
+    "limit": 12,
+    "language": "en",
+    "medicines": [{"name":"Domperidone 10mg"}, {"name":"Simethicone 40mg"}]
+  }
 }
-
-// Server responds (medical result):
-{
-  "type": "medical_response",
-  "message": "analysis text ...",
-  "medicines": [{...}],
-  "severity": "low|medium|high",
-  "disclaimer": "...",
-  "seekEmergencyCare": false,
-  "uiLabels": { "recommended": "...", "dosage": "...", "availability": "...", "emergency": "..." },
-  "language": "id|vi|ms|en|..."
-}
-                    </pre>
-                </div>
+                </pre>
                 """)
-
-        # Events
         process_btn.click(fn=process_pdf_files, inputs=[file_upload], outputs=[upload_status], show_progress=True)
         reset_btn.click(fn=reset_system, outputs=[upload_status])
         refresh_status_btn.click(fn=get_system_status, outputs=[system_status])
-
-        # Auto-refresh on load
         demo.load(fn=get_system_status, outputs=[system_status])
-
     return demo
 
-
-# -----------------------------------------------------------------------------
-# Entrypoint
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     if not os.getenv("SEALION_API_KEY"):
-        print("⚠️  Warning: SEALION_API_KEY not set!")
-        print("Set it with: export SEALION_API_KEY=your-api-key")
-
-    # Start WebSocket server in a background thread
-    websocket_thread = threading.Thread(target=start_websocket_server, daemon=True)
-    websocket_thread.start()
-
-    # Launch Gradio admin UI
-    demo = create_admin_interface()
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, show_error=True)
+        print("Warning: SEALION_API_KEY not set!\nSet it with: export SEALION_API_KEY=your-api-key")
+    threading.Thread(target=start_websocket_server, daemon=True).start()
+    create_admin_interface().launch(server_name="0.0.0.0", server_port=7860, share=False, show_error=True)
