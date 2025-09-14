@@ -29,10 +29,13 @@ SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8080")
 OVERPASS_URL = os.getenv("OVERPASS_URL", "https://overpass-api.de/api/interpreter")
 USER_AGENT = "GraphRAG-Pharmacy/1.0 (+inventory)"
 
-# OSRM router
-OSRM_URL = os.getenv("OSRM_URL", "http://router.project-osrm.org")  # e.g. http://localhost:5000
--
-# SEALION LangChain Wrapper 
+# Google Directions (walking) — REQUIRED
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+GOOGLE_DIRECTIONS_URL = "https://maps.googleapis.com/maps/api/directions/json"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SEALION LangChain Wrapper
+# ──────────────────────────────────────────────────────────────────────────────
 class SEALIONWrapper(LLM):
     client: Any = None
     model_name: str = "aisingapore/Llama-SEA-LION-v3.5-8B-R"
@@ -117,7 +120,9 @@ class SEALIONWrapper(LLM):
         return out
 
 
-# Model Initialization / PDFs
+# ──────────────────────────────────────────────────────────────────────────────
+# Models & PDFs
+# ──────────────────────────────────────────────────────────────────────────────
 def initialize_models() -> Tuple[Optional[GraphRAG], str]:
     try:
         from sentence_transformers import SentenceTransformer
@@ -220,7 +225,9 @@ def process_pdf_files(files) -> str:
         logger.error(msg)
         return msg
 
-# Helper: Overpass, OSRM, SearXNG (GPS-only)
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers: Overpass, SearXNG, Google Directions (walking)
+# ──────────────────────────────────────────────────────────────────────────────
 def searxng_search(query: str, language: Optional[str] = None, pageno: int = 1, timeout: int = 10) -> Dict[str, Any]:
     url = SEARXNG_URL.rstrip("/") + "/search"
     params = {"q": query, "format": "json", "pageno": pageno, "safesearch": 1}
@@ -245,54 +252,45 @@ def overpass_pharmacies(center: Dict[str, float], radius_km: int, limit: int = 5
     data = r.json()
     return data.get("elements", [])
 
-def osrm_route_km_min(
+def google_route_km_min(
     lat1: float, lon1: float, lat2: float, lon2: float,
+    mode: str = "walking",
     timeout: int = 15,
-    origin_snap_radius_m: int = 80,   # tighten snap to avoid far jumps
-    dest_snap_radius_m: int = 150
 ) -> Optional[Tuple[float, float]]:
     """
-    Returns (distance_km, duration_min) using OSRM. None if no route found.
-    Uses 'radiuses' to limit how far OSRM may snap points to the road network.
+    Returns (distance_km, duration_min) using Google Directions API.
+    mode: walking | driving | transit | bicycling
     """
+    if not GOOGLE_MAPS_API_KEY:
+        logger.debug("Google API key missing; cannot compute route.")
+        return None
     try:
-        url = f"{OSRM_URL.rstrip('/')}/route/v1/driving/{lon1},{lat1};{lon2},{lat2}"
         params = {
-            "overview": "false",
+            "origin": f"{lat1},{lon1}",
+            "destination": f"{lat2},{lon2}",
+            "mode": mode,
+            "units": "metric",
             "alternatives": "false",
-            "steps": "false",
-            "radiuses": f"{origin_snap_radius_m};{dest_snap_radius_m}",
+            "key": GOOGLE_MAPS_API_KEY,
         }
-        r = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+        r = requests.get(GOOGLE_DIRECTIONS_URL, params=params, timeout=timeout)
         r.raise_for_status()
         js = r.json()
-        if not js.get("routes"):
+        if js.get("status") != "OK" or not js.get("routes"):
+            # Common statuses: ZERO_RESULTS, OVER_DAILY_LIMIT, REQUEST_DENIED, INVALID_REQUEST
+            logger.debug(f"Google Directions non-OK: {js.get('status')}")
             return None
-        route = js["routes"][0]
-        dist_km = round((route.get("distance", 0.0) or 0.0) / 1000.0, 2)
-        dur_min = round((route.get("duration", 0.0) or 0.0) / 60.0, 1)
+        leg = js["routes"][0]["legs"][0]
+        dist_km = round((leg["distance"]["value"] or 0) / 1000.0, 2)  # meters → km
+        dur_min = round((leg["duration"]["value"] or 0) / 60.0, 1)    # seconds → min
         return dist_km, dur_min
     except Exception as e:
-        logger.debug(f"OSRM route error: {e}")
+        logger.debug(f"Google Directions error: {e}")
         return None
 
-def score_availability(text: str) -> Optional[str]:
-    t = (text or "").lower()
-    if any(k in t for k in ["in stock", "available", "còn hàng", "có sẵn", "thêm vào giỏ", "add to cart"]):
-        return "in_stock"
-    if any(k in t for k in ["out of stock", "hết hàng", "ngừng kinh doanh"]):
-        return "out_of_stock"
-    return None
-
-def status_to_score(status: str) -> float:
-    return {
-        "in_stock": 0.92,
-        "likely_in_stock": 0.70,
-        "call_to_confirm": 0.50,
-        "out_of_stock": 0.0,
-    }.get(status, 0.0)
-
+# ──────────────────────────────────────────────────────────────────────────────
 # GPS-only pharmacy search
+# ──────────────────────────────────────────────────────────────────────────────
 async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     GPS-only.
@@ -381,7 +379,7 @@ async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
             "city": tags.get("addr:city"),
             "phoneNumber": tags.get("phone") or tags.get("contact:phone"),
             "openingHours": tags.get("opening_hours"),
-            # distance_km to be filled via OSRM
+            # distance_km / duration_min to be filled via Google
         })
 
     if not candidates:
@@ -395,16 +393,14 @@ async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
             "message": "No nearby pharmacies found from Overpass.",
         }
 
-    # 2) OSRM route distance/ETA from GPS (with limited snapping)
-    async def add_osrm_metrics(p: Dict[str, Any]) -> Dict[str, Any]:
+    # 2) Google route distance/ETA from GPS (walking)
+    async def add_route_metrics(p: Dict[str, Any]) -> Dict[str, Any]:
         try:
             lat2, lon2 = float(p["latitude"]), float(p["longitude"])
             res = await asyncio.to_thread(
-                osrm_route_km_min,
+                google_route_km_min,
                 center["lat"], center["lon"], lat2, lon2,
-                15,   # timeout
-                80,   # origin snap radius (m)
-                150   # destination snap radius (m)
+                "walking", 15
             )
             if res is not None:
                 dist_km, dur_min = res
@@ -414,13 +410,29 @@ async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
                 p["distance_km"] = None
             return p
         except Exception as e:
-            logger.debug(f"OSRM metrics error for {p.get('id')}: {e}")
+            logger.debug(f"Route metrics error for {p.get('id')}: {e}")
             p["distance_km"] = None
             return p
 
-    candidates = await asyncio.gather(*[add_osrm_metrics(p) for p in candidates])
+    candidates = await asyncio.gather(*[add_route_metrics(p) for p in candidates])
 
     # 3) Availability via SearXNG
+    def score_availability(text: str) -> Optional[str]:
+        t = (text or "").lower()
+        if any(k in t for k in ["in stock", "available", "còn hàng", "có sẵn", "thêm vào giỏ", "add to cart"]):
+            return "in_stock"
+        if any(k in t for k in ["out of stock", "hết hàng", "ngừng kinh doanh"]):
+            return "out_of_stock"
+        return None
+
+    def status_to_score(status: str) -> float:
+        return {
+            "in_stock": 0.92,
+            "likely_in_stock": 0.70,
+            "call_to_confirm": 0.50,
+            "out_of_stock": 0.0,
+        }.get(status, 0.0)
+
     async def enrich_pharmacy(p: Dict[str, Any]) -> Dict[str, Any]:
         matches = []
         for m in medicines:
@@ -469,16 +481,17 @@ async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     return {
-        "center": center,        
+        "center": center,
         "city": None,
         "pharmacies": enriched[:limit],
-        "source": "overpass+searxng+osrm (gps-only, unbiased)",
+        "source": "overpass+searxng+google-directions (walking)",
         "fallbackUsed": False,
         "radius_km": radius_km,
     }
 
-
-# WebSocket + Admin UI 
+# ──────────────────────────────────────────────────────────────────────────────
+# WebSocket + Admin UI
+# ──────────────────────────────────────────────────────────────────────────────
 async def process_client_message(message: str, websocket) -> str:
     global graph_rag_system, documents_processed
     try:
@@ -613,5 +626,7 @@ def create_admin_interface():
 if __name__ == "__main__":
     if not os.getenv("SEALION_API_KEY"):
         print("Warning: SEALION_API_KEY not set!\nSet it with: export SEALION_API_KEY=your-api-key")
+    if not GOOGLE_MAPS_API_KEY:
+        print("Warning: GOOGLE_MAPS_API_KEY not set! Walking ETA will be missing.")
     threading.Thread(target=start_websocket_server, daemon=True).start()
     create_admin_interface().launch(server_name="0.0.0.0", server_port=7860, share=False, show_error=True)
