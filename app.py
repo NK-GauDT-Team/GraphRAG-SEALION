@@ -25,11 +25,16 @@ websocket_server = None
 connected_clients = set()
 
 # Search-agent config
-SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8080")
-OVERPASS_URL = os.getenv("OVERPASS_URL", "https://overpass-api.de/api/interpreter")
+SEARXNG_URL = os.getenv("SEARXNG_URL", "https://searxng.hweeren.com/")
+OVERPASS_URLS = [
+    os.getenv("OVERPASS_URL") or "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.fr/api/interpreter",
+    "https://z.overpass-api.de/api/interpreter",
+]
 USER_AGENT = "GraphRAG-Pharmacy/1.0 (+inventory)"
 
-# Google Directions (walking) — REQUIRED
+# Google Directions — REQUIRED for distance/ETA
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 GOOGLE_DIRECTIONS_URL = "https://maps.googleapis.com/maps/api/directions/json"
 
@@ -38,7 +43,7 @@ GOOGLE_DIRECTIONS_URL = "https://maps.googleapis.com/maps/api/directions/json"
 # ──────────────────────────────────────────────────────────────────────────────
 class SEALIONWrapper(LLM):
     client: Any = None
-    model_name: str = "aisingapore/Llama-SEA-LION-v3.5-8B-R"
+    model_name: str = "aisingapore/Llama-SEA-LION-v3.5-70B-R"
 
     def __init__(self, api_key: str, **kwargs):
         super().__init__(**kwargs)
@@ -226,7 +231,7 @@ def process_pdf_files(files) -> str:
         return msg
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers: Overpass, SearXNG, Google Directions (walking)
+# Helpers: Overpass, SearXNG, Google Directions
 # ──────────────────────────────────────────────────────────────────────────────
 def searxng_search(query: str, language: Optional[str] = None, pageno: int = 1, timeout: int = 10) -> Dict[str, Any]:
     url = SEARXNG_URL.rstrip("/") + "/search"
@@ -237,20 +242,27 @@ def searxng_search(query: str, language: Optional[str] = None, pageno: int = 1, 
     r.raise_for_status()
     return r.json()
 
-def overpass_pharmacies(center: Dict[str, float], radius_km: int, limit: int = 50) -> List[Dict[str, Any]]:
+def overpass_pharmacies(center, radius_km, limit=50):
     R = max(100, min(50000, int(radius_km * 1000)))
     q = f"""
-    [out:json][timeout:25];
+    [out:json][timeout:60];
     (
       node["amenity"="pharmacy"](around:{R},{center['lat']},{center['lon']});
       way["amenity"="pharmacy"](around:{R},{center['lat']},{center['lon']});
     );
     out tags center {min(limit, 200)};
     """
-    r = requests.post(OVERPASS_URL, data=q, headers={"User-Agent": USER_AGENT}, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("elements", [])
+    last = None
+    for url in OVERPASS_URLS:
+        try:
+            r = requests.post(url, data=q, headers={"User-Agent": USER_AGENT}, timeout=60)
+            r.raise_for_status()
+            return r.json().get("elements", [])
+        except Exception as e:
+            last = e
+            logger.warning(f"Overpass fail {url}: {e}")
+            continue
+    raise last or RuntimeError("Overpass failed")
 
 def google_route_km_min(
     lat1: float, lon1: float, lat2: float, lon2: float,
@@ -277,7 +289,6 @@ def google_route_km_min(
         r.raise_for_status()
         js = r.json()
         if js.get("status") != "OK" or not js.get("routes"):
-            # Common statuses: ZERO_RESULTS, OVER_DAILY_LIMIT, REQUEST_DENIED, INVALID_REQUEST
             logger.debug(f"Google Directions non-OK: {js.get('status')}")
             return None
         leg = js["routes"][0]["legs"][0]
@@ -291,6 +302,8 @@ def google_route_km_min(
 # ──────────────────────────────────────────────────────────────────────────────
 # GPS-only pharmacy search
 # ──────────────────────────────────────────────────────────────────────────────
+ALLOWED_TRAVEL_MODES = {"walking", "driving"}  # easy to extend later
+
 async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     GPS-only.
@@ -299,7 +312,8 @@ async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
       "radius_km": int,
       "limit": int,
       "language": str | None,
-      "medicines": [{"name": str, "dosage": str?}, ...]
+      "medicines": [{"name": str, "dosage": str?}, ...],
+      "mode": "walking" | "driving"   # NEW: optional, default "walking"
     }
     """
     user_location = payload.get("user_location")
@@ -307,6 +321,8 @@ async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
     limit = int(payload.get("limit") or 12)
     language = payload.get("language")
     medicines = payload.get("medicines") or []
+    mode_in = (payload.get("mode") or "walking").lower().strip()
+    mode = mode_in if mode_in in ALLOWED_TRAVEL_MODES else "walking"
 
     if not medicines:
         return {"center": None, "city": None, "pharmacies": [], "message": "No medicines provided."}
@@ -329,7 +345,7 @@ async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
         accuracy_m = 0.0
 
     center = {"lat": float(user_location["lat"]), "lon": float(user_location["lon"])}
-    logger.info(f"🔎 GPS center used: {center} (accuracy_m={accuracy_m})")
+    logger.info(f"🔎 GPS center used: {center} (accuracy_m={accuracy_m}) mode={mode}")
 
     # Reject obviously-bad fixes to avoid routing from a wrong district
     if accuracy_m and accuracy_m > 1000:
@@ -379,7 +395,6 @@ async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
             "city": tags.get("addr:city"),
             "phoneNumber": tags.get("phone") or tags.get("contact:phone"),
             "openingHours": tags.get("opening_hours"),
-            # distance_km / duration_min to be filled via Google
         })
 
     if not candidates:
@@ -393,14 +408,14 @@ async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
             "message": "No nearby pharmacies found from Overpass.",
         }
 
-    # 2) Google route distance/ETA from GPS (walking)
+    # 2) Google route distance/ETA from GPS (mode selected)
     async def add_route_metrics(p: Dict[str, Any]) -> Dict[str, Any]:
         try:
             lat2, lon2 = float(p["latitude"]), float(p["longitude"])
             res = await asyncio.to_thread(
                 google_route_km_min,
                 center["lat"], center["lon"], lat2, lon2,
-                "walking", 15
+                mode, 15
             )
             if res is not None:
                 dist_km, dur_min = res
@@ -416,7 +431,7 @@ async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     candidates = await asyncio.gather(*[add_route_metrics(p) for p in candidates])
 
-    # 3) Availability via SearXNG
+    # 3) Availability via SearXNG (best-effort heuristic)
     def score_availability(text: str) -> Optional[str]:
         t = (text or "").lower()
         if any(k in t for k in ["in stock", "available", "còn hàng", "có sẵn", "thêm vào giỏ", "add to cart"]):
@@ -484,7 +499,7 @@ async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
         "center": center,
         "city": None,
         "pharmacies": enriched[:limit],
-        "source": "overpass+searxng+google-directions (walking)",
+        "source": f"overpass+searxng+google-directions ({mode})",
         "fallbackUsed": False,
         "radius_km": radius_km,
     }
@@ -596,27 +611,12 @@ def create_admin_interface():
         with gr.Row():
             with gr.Column():
                 file_upload = gr.File(label="Upload PDF Files", file_types=[".pdf"], file_count="multiple")
-                process_btn = gr.Button("🚀 Process Documents", variant="primary")
+                process_btn = gr.Button("Process Documents", variant="primary")
                 upload_status = gr.Textbox(label="Processing Status", interactive=False, lines=10)
             with gr.Column():
                 system_status = gr.Textbox(label="Current Status", interactive=False, lines=6, value=get_system_status())
-                refresh_status_btn = gr.Button("🔄 Refresh Status")
-                reset_btn = gr.Button("🗑️ Reset System", variant="stop")
-                gr.HTML("""
-                <pre>// Pharmacy search payload (GPS-only)
-{
-  "type": "pharmacy_search",
-  "rid": "uuid-or-timestamp",
-  "payload": {
-    "user_location": {"lat": 1.3521, "lon": 103.8198, "accuracy_m": 25},
-    "radius_km": 8,
-    "limit": 12,
-    "language": "en",
-    "medicines": [{"name":"Domperidone 10mg"}, {"name":"Simethicone 40mg"}]
-  }
-}
-                </pre>
-                """)
+                refresh_status_btn = gr.Button("Refresh Status")
+                reset_btn = gr.Button("Reset System", variant="stop")
         process_btn.click(fn=process_pdf_files, inputs=[file_upload], outputs=[upload_status], show_progress=True)
         reset_btn.click(fn=reset_system, outputs=[upload_status])
         refresh_status_btn.click(fn=get_system_status, outputs=[system_status])
@@ -627,6 +627,6 @@ if __name__ == "__main__":
     if not os.getenv("SEALION_API_KEY"):
         print("Warning: SEALION_API_KEY not set!\nSet it with: export SEALION_API_KEY=your-api-key")
     if not GOOGLE_MAPS_API_KEY:
-        print("Warning: GOOGLE_MAPS_API_KEY not set! Walking ETA will be missing.")
+        print("Warning: GOOGLE_MAPS_API_KEY not set! Distance/ETA will be missing.")
     threading.Thread(target=start_websocket_server, daemon=True).start()
     create_admin_interface().launch(server_name="0.0.0.0", server_port=7860, share=False, show_error=True)
