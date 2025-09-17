@@ -264,6 +264,28 @@ def overpass_pharmacies(center, radius_km, limit=50):
             continue
     raise last or RuntimeError("Overpass failed")
 
+def overpass_convenience(center, radius_km, limit=50):
+    R = max(100, min(50000, int(radius_km * 1000)))
+    q = f"""
+    [out:json][timeout:60];
+    (
+      node["shop"="convenience"](around:{R},{center['lat']},{center['lon']});
+      way["shop"="convenience"](around:{R},{center['lat']},{center['lon']});
+    );
+    out tags center {min(limit, 200)};
+    """
+    last = None
+    for url in OVERPASS_URLS:
+        try:
+            r = requests.post(url, data=q, headers={"User-Agent": USER_AGENT}, timeout=60)
+            r.raise_for_status()
+            return r.json().get("elements", [])
+        except Exception as e:
+            last = e
+            logger.warning(f"Overpass fail {url}: {e}")
+            continue
+    raise last or RuntimeError("Overpass failed")
+
 def google_route_km_min(
     lat1: float, lon1: float, lat2: float, lon2: float,
     mode: str = "walking",
@@ -504,6 +526,208 @@ async def run_pharmacy_search(payload: Dict[str, Any]) -> Dict[str, Any]:
         "radius_km": radius_km,
     }
 
+
+async def run_convenience_search(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    GPS-only.
+    payload: {
+      "user_location": {"lat": float, "lon": float, "accuracy_m"?: number, "ts"?: number},  # REQUIRED
+      "radius_km": int,
+      "limit": int,
+      "language": str | None,
+      "medicines": [{"name": str, "dosage": str?}, ...],
+      "mode": "walking" | "driving"   # NEW: optional, default "walking"
+    }
+    """
+    user_location = payload.get("user_location")
+    radius_km = int(payload.get("radius_km") or 8)
+    limit = int(payload.get("limit") or 12)
+    language = payload.get("language")
+    medicines = payload.get("medicines") or []
+    mode_in = (payload.get("mode") or "walking").lower().strip()
+    mode = mode_in if mode_in in ALLOWED_TRAVEL_MODES else "walking"
+
+    if not medicines:
+        return {"center": None, "city": None, "convenience": [], "message": "No local remedy provided."}
+
+    if not user_location or "lat" not in user_location or "lon" not in user_location:
+        return {
+            "center": None,
+            "city": None,
+            "convenience": [],
+            "source": "gps-only",
+            "fallbackUsed": False,
+            "radius_km": radius_km,
+            "message": "GPS not provided. Tap 'Use my location'.",
+        }
+
+    # Pull accuracy if provided
+    try:
+        accuracy_m = float(user_location.get("accuracy_m") or 0.0)
+    except Exception:
+        accuracy_m = 0.0
+
+    center = {"lat": float(user_location["lat"]), "lon": float(user_location["lon"])}
+    logger.info(f"🔎 GPS center used: {center} (accuracy_m={accuracy_m}) mode={mode}")
+
+    # Reject obviously-bad fixes to avoid routing from a wrong district
+    if accuracy_m and accuracy_m > 1000:
+        return {
+            "center": center,
+            "city": None,
+            "pharmacies": [],
+            "source": "gps-only",
+            "fallbackUsed": False,
+            "radius_km": radius_km,
+            "message": f"Location too imprecise (~{int(accuracy_m)}m). Try again near a window with Precise Location on.",
+        }
+
+    # 1) Nearby pharmacies via Overpass around GPS
+    try:
+        elems = await asyncio.to_thread(overpass_convenience, center, radius_km, max(100, limit * 4))
+    except Exception as e:
+        logger.error(f"Overpass error: {e}")
+        elems = []
+
+    candidates: List[Dict[str, Any]] = []
+    for e in elems:
+        tags = e.get("tags", {}) or {}
+        lat = (e.get("lat") or e.get("center", {}).get("lat"))
+        lon = (e.get("lon") or e.get("center", {}).get("lon"))
+        if lat is None or lon is None:
+            continue
+
+        addr_parts = [
+            tags.get("addr:housenumber"),
+            tags.get("addr:street"),
+            tags.get("addr:suburb"),
+            tags.get("addr:city"),
+            tags.get("addr:state"),
+            tags.get("addr:postcode"),
+            tags.get("addr:country"),
+        ]
+        address = ", ".join([p for p in addr_parts if p])
+
+        candidates.append({
+            "id": f"osm_{e.get('type','n')}_{e.get('id')}",
+            "name": tags.get("name") or "convenience",
+            "address": address or tags.get("addr:full"),
+            "latitude": str(lat),
+            "longitude": str(lon),
+            "country": tags.get("addr:country"),
+            "city": tags.get("addr:city"),
+            "phoneNumber": tags.get("phone") or tags.get("contact:phone"),
+            "openingHours": tags.get("opening_hours"),
+        })
+
+    if not candidates:
+        return {
+            "center": center,
+            "city": None,
+            "convenience": [],
+            "source": "overpass (none)",
+            "fallbackUsed": False,
+            "radius_km": radius_km,
+            "message": "No nearby convenience store found from Overpass.",
+        }
+
+    # 2) Google route distance/ETA from GPS (mode selected)
+    async def add_route_metrics(p: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            lat2, lon2 = float(p["latitude"]), float(p["longitude"])
+            res = await asyncio.to_thread(
+                google_route_km_min,
+                center["lat"], center["lon"], lat2, lon2,
+                mode, 15
+            )
+            if res is not None:
+                dist_km, dur_min = res
+                p["distance_km"] = dist_km
+                p["duration_min"] = dur_min
+            else:
+                p["distance_km"] = None
+            return p
+        except Exception as e:
+            logger.debug(f"Route metrics error for {p.get('id')}: {e}")
+            p["distance_km"] = None
+            return p
+
+    candidates = await asyncio.gather(*[add_route_metrics(p) for p in candidates])
+
+    # 3) Availability via SearXNG (best-effort heuristic)
+    def score_availability(text: str) -> Optional[str]:
+        t = (text or "").lower()
+        if any(k in t for k in ["in stock", "available", "add to cart"]):
+            return "in_stock"
+        if any(k in t for k in ["out of stock"]):
+            return "out_of_stock"
+        return None
+
+    def status_to_score(status: str) -> float:
+        return {
+            "in_stock": 0.92,
+            "likely_in_stock": 0.70,
+            "call_to_confirm": 0.50,
+            "out_of_stock": 0.0,
+        }.get(status, 0.0)
+
+    async def enrich_convenience(p: Dict[str, Any]) -> Dict[str, Any]:
+        matches = []
+        for m in medicines:
+            med_name = m.get("name") or ""
+            base_queries: List[str] = [
+                f'{med_name} "{p["name"]}"',
+                f"{med_name}"
+            ]
+
+            best = None
+            for q in base_queries[:3]:
+                try:
+                    js = await asyncio.to_thread(searxng_search, q, language)
+                except Exception:
+                    continue
+                for item in js.get("results", []):
+                    text = f'{item.get("title","")} {item.get("content","")}'
+                    status = score_availability(text) or "likely_in_stock"
+                    cand = {
+                        "medicineName": med_name,
+                        "status": status,
+                        "score": status_to_score(status),
+                        "url": item.get("url"),
+                    }
+                    if (best is None) or (cand["score"] > best["score"]):
+                        best = cand
+            if best is None:
+                best = {"medicineName": med_name, "status": "call_to_confirm", "score": status_to_score("call_to_confirm")}
+            matches.append(best)
+
+        best_score = max((mm["score"] for mm in matches), default=0.0)
+        p_out = {**p, "matches": matches, "bestScore": best_score}
+        return p_out
+
+    enriched = await asyncio.gather(*[enrich_convenience(p) for p in candidates])
+
+    def good_count(ph: Dict[str, Any]) -> int:
+        return sum(1 for mm in ph.get("matches", []) if mm["status"] != "out_of_stock")
+
+    enriched.sort(
+        key=lambda ph: (
+            -good_count(ph),
+            -(ph.get("bestScore") or 0.0),
+            ph.get("distance_km") if ph.get("distance_km") is not None else 1e9,
+        )
+    )
+
+    return {
+        "center": center,
+        "city": None,
+        "convenience": enriched[:limit],
+        "source": f"overpass+searxng+google-directions ({mode})",
+        "fallbackUsed": False,
+        "radius_km": radius_km,
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # WebSocket + Admin UI
 # ──────────────────────────────────────────────────────────────────────────────
@@ -519,6 +743,13 @@ async def process_client_message(message: str, websocket) -> str:
             logger.info(f"🔎 Pharmacy search rid={rid} payload={str(payload)[:200]}...")
             result = await run_pharmacy_search(payload)
             return json.dumps({"type": "pharmacy_search_result", "rid": rid, **result})
+        
+        if msg_type == "convenience_search":
+            rid = data.get("rid")
+            payload = data.get("payload") or {}
+            logger.info(f"Convenience store search rid={rid} payload={str(payload)[:200]}...")
+            result = await run_convenience_search(payload)
+            return json.dumps({"type": "convenience_search_result", "rid": rid, **result})
 
         if not documents_processed or graph_rag_system is None:
             return json.dumps({"type": "error", "message": "System not ready. Please upload and process documents."})
